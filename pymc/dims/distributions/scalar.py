@@ -1,0 +1,518 @@
+#   Copyright 2025 - present The PyMC Developers
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+import numpy as np
+import pytensor.xtensor as ptx
+import pytensor.xtensor.random as ptxr
+
+from pytensor.xtensor import as_xtensor
+from pytensor.xtensor.basic import xtensor_from_tensor
+
+import pymc.distributions as regular_dists
+
+from pymc.dims.distributions.core import (
+    DimDistribution,
+    PositiveDimDistribution,
+    UnitDimDistribution,
+    copy_docstring,
+)
+from pymc.dims.distributions.transforms import IntervalTransform, circular
+from pymc.distributions.continuous import Beta as RegularBeta
+from pymc.distributions.continuous import Gamma as RegularGamma
+from pymc.distributions.continuous import (
+    HalfCauchyRV,
+    HalfStudentTRV,
+    KumaraswamyRV,
+    WeibullBetaRV,
+    flat,
+    halfflat,
+    truncated_normal,
+    wald,
+)
+from pymc.distributions.continuous import Wald as RegularWald
+from pymc.distributions.discrete import NegativeBinomial as RegularNegativeBinomial
+from pymc.distributions.distribution import DiracDeltaRV
+from pymc.pytensorf import continuous_types, floatX
+from pymc.util import UNSET
+
+
+def _get_sigma_from_either_sigma_or_tau(*, sigma, tau):
+    if sigma is not None and tau is not None:
+        raise ValueError("Can't pass both tau and sigma")
+
+    if sigma is None and tau is None:
+        return 1.0
+
+    if sigma is not None:
+        return sigma
+
+    return ptx.math.reciprocal(ptx.math.sqrt(tau))
+
+
+@copy_docstring(regular_dists.Flat)
+class Flat(DimDistribution):
+    xrv_op = ptxr.as_xrv(flat)
+
+    @classmethod
+    def dist(cls, **kwargs):
+        return super().dist([], **kwargs)
+
+
+@copy_docstring(regular_dists.HalfFlat)
+class HalfFlat(PositiveDimDistribution):
+    xrv_op = ptxr.as_xrv(halfflat, [], ())
+
+    @classmethod
+    def dist(cls, **kwargs):
+        return super().dist([], **kwargs)
+
+
+@copy_docstring(regular_dists.Triangular)
+class Triangular(DimDistribution):
+    def __new__(
+        cls, name, lower=0, upper=1, c=0.5, default_transform=UNSET, observed=None, **kwargs
+    ):
+        if observed is None and default_transform is UNSET:
+            default_transform = IntervalTransform(lower, upper)
+        return super().__new__(
+            cls,
+            name,
+            lower,
+            c,
+            upper,
+            default_transform=default_transform,
+            observed=observed,
+            **kwargs,
+        )
+
+    xrv_op = ptxr.triangular
+
+    @classmethod
+    def dist(cls, lower, c, upper, **kwargs):
+        return super().dist([lower, c, upper], **kwargs)
+
+
+@copy_docstring(regular_dists.Uniform)
+class Uniform(DimDistribution):
+    xrv_op = ptxr.uniform
+
+    def __new__(cls, name, lower=0, upper=1, default_transform=UNSET, observed=None, **kwargs):
+        if observed is None and default_transform is UNSET:
+            default_transform = IntervalTransform(lower, upper)
+        return super().__new__(
+            cls,
+            name,
+            lower=lower,
+            upper=upper,
+            default_transform=default_transform,
+            observed=observed,
+            **kwargs,
+        )
+
+    @classmethod
+    def dist(cls, lower=0, upper=1, **kwargs):
+        return super().dist([lower, upper], **kwargs)
+
+
+@copy_docstring(regular_dists.Normal)
+class Normal(DimDistribution):
+    xrv_op = ptxr.normal
+
+    @classmethod
+    def dist(cls, mu=0, sigma=None, *, tau=None, **kwargs):
+        sigma = _get_sigma_from_either_sigma_or_tau(sigma=sigma, tau=tau)
+        return super().dist([mu, sigma], **kwargs)
+
+
+@copy_docstring(regular_dists.HalfNormal)
+class HalfNormal(PositiveDimDistribution):
+    xrv_op = ptxr.halfnormal
+
+    @classmethod
+    def dist(cls, sigma=None, *, tau=None, **kwargs):
+        sigma = _get_sigma_from_either_sigma_or_tau(sigma=sigma, tau=tau)
+        return super().dist([0.0, sigma], **kwargs)
+
+
+@copy_docstring(regular_dists.TruncatedNormal)
+class TruncatedNormal(DimDistribution):
+    xrv_op = ptxr.as_xrv(truncated_normal)
+
+    def __new__(
+        cls,
+        name,
+        *args,
+        lower=-np.inf,
+        upper=np.inf,
+        default_transform=UNSET,
+        observed=None,
+        **kwargs,
+    ):
+        if observed is None and default_transform is UNSET:
+            default_transform = IntervalTransform(lower, upper)
+        return super().__new__(
+            cls,
+            name,
+            *args,
+            lower=lower,
+            upper=upper,
+            default_transform=default_transform,
+            observed=observed,
+            **kwargs,
+        )
+
+    @classmethod
+    def dist(cls, mu=0, sigma=None, *, tau=None, lower=-np.inf, upper=np.inf, **kwargs):
+        sigma = _get_sigma_from_either_sigma_or_tau(sigma=sigma, tau=tau)
+        return super().dist([mu, sigma, lower, upper], **kwargs)
+
+
+@copy_docstring(regular_dists.Logistic)
+class Logistic(DimDistribution):
+    xrv_op = ptxr.logistic
+
+    @classmethod
+    def dist(cls, mu, s, **kwargs):
+        return super().dist([mu, s], **kwargs)
+
+
+@copy_docstring(regular_dists.LogNormal)
+class LogNormal(PositiveDimDistribution):
+    xrv_op = ptxr.lognormal
+
+    @classmethod
+    def dist(cls, mu=0, sigma=None, *, tau=None, **kwargs):
+        sigma = _get_sigma_from_either_sigma_or_tau(sigma=sigma, tau=tau)
+        return super().dist([mu, sigma], **kwargs)
+
+
+@copy_docstring(regular_dists.StudentT)
+class StudentT(DimDistribution):
+    xrv_op = ptxr.t
+
+    @classmethod
+    def dist(cls, nu, mu=0, sigma=None, *, lam=None, **kwargs):
+        sigma = _get_sigma_from_either_sigma_or_tau(sigma=sigma, tau=lam)
+        return super().dist([nu, mu, sigma], **kwargs)
+
+
+@copy_docstring(regular_dists.HalfStudentT)
+class HalfStudentT(PositiveDimDistribution):
+    @classmethod
+    def dist(cls, nu, sigma=None, *, lam=None, **kwargs):
+        sigma = _get_sigma_from_either_sigma_or_tau(sigma=sigma, tau=lam)
+        return super().dist([nu, sigma], **kwargs)
+
+    @classmethod
+    def xrv_op(self, nu, sigma, core_dims=None, extra_dims=None, rng=None, **kwargs):
+        nu = as_xtensor(nu)
+        sigma = as_xtensor(sigma)
+        core_rv = HalfStudentTRV.rv_op(nu=nu.values, sigma=sigma.values).owner.op
+        xop = ptxr.as_xrv(core_rv)
+        return xop(nu, sigma, core_dims=core_dims, extra_dims=extra_dims, rng=rng, **kwargs)
+
+
+@copy_docstring(regular_dists.VonMises)
+class VonMises(DimDistribution):
+    xrv_op = ptxr.vonmises
+    default_transform = circular
+
+    @classmethod
+    def dist(cls, mu, kappa, **kwargs):
+        return super().dist([mu, kappa], **kwargs)
+
+
+@copy_docstring(regular_dists.Cauchy)
+class Cauchy(DimDistribution):
+    xrv_op = ptxr.cauchy
+
+    @classmethod
+    def dist(cls, alpha, beta, **kwargs):
+        return super().dist([alpha, beta], **kwargs)
+
+
+@copy_docstring(regular_dists.HalfCauchy)
+class HalfCauchy(PositiveDimDistribution):
+    @classmethod
+    def dist(cls, beta, **kwargs):
+        return super().dist([beta], **kwargs)
+
+    @classmethod
+    def xrv_op(self, beta, core_dims, extra_dims=None, rng=None, **kwargs):
+        beta = as_xtensor(beta)
+        core_rv = HalfCauchyRV.rv_op(beta=beta.values).owner.op
+        xop = ptxr.as_xrv(core_rv)
+        return xop(beta, core_dims=core_dims, extra_dims=extra_dims, rng=rng, **kwargs)
+
+
+@copy_docstring(regular_dists.Beta)
+class Beta(UnitDimDistribution):
+    xrv_op = ptxr.beta
+
+    @classmethod
+    def dist(cls, alpha=None, beta=None, *, mu=None, sigma=None, nu=None, **kwargs):
+        alpha, beta = RegularBeta.get_alpha_beta(alpha=alpha, beta=beta, mu=mu, sigma=sigma, nu=nu)
+        return super().dist([alpha, beta], **kwargs)
+
+
+@copy_docstring(regular_dists.Kumaraswamy)
+class Kumaraswamy(UnitDimDistribution):
+    @classmethod
+    def dist(cls, a, b, **kwargs):
+        return super().dist([a, b], **kwargs)
+
+    @classmethod
+    def xrv_op(cls, a, b, core_dims, extra_dims=None, rng=None, **kwargs):
+        a = as_xtensor(a)
+        b = as_xtensor(b)
+        core_rv = KumaraswamyRV.rv_op(a=a.values, b=b.values).owner.op
+        xop = ptxr.as_xrv(core_rv)
+        return xop(a, b, core_dims=core_dims, extra_dims=extra_dims, rng=rng, **kwargs)
+
+
+@copy_docstring(regular_dists.Laplace)
+class Laplace(DimDistribution):
+    xrv_op = ptxr.laplace
+
+    @classmethod
+    def dist(cls, mu=0, b=1, **kwargs):
+        return super().dist([mu, b], **kwargs)
+
+
+@copy_docstring(regular_dists.Exponential)
+class Exponential(PositiveDimDistribution):
+    xrv_op = ptxr.exponential
+
+    @classmethod
+    def dist(cls, lam=None, *, scale=None, **kwargs):
+        if lam is None and scale is None:
+            scale = 1.0
+        elif lam is not None and scale is not None:
+            raise ValueError("Cannot pass both 'lam' and 'scale'. Use one of them.")
+        elif lam is not None:
+            scale = 1 / lam
+        return super().dist([scale], **kwargs)
+
+
+@copy_docstring(regular_dists.Gamma)
+class Gamma(PositiveDimDistribution):
+    xrv_op = ptxr.gamma
+
+    @classmethod
+    def dist(cls, alpha=None, beta=None, *, mu=None, sigma=None, **kwargs):
+        if (alpha is not None) and (beta is not None):
+            pass
+        elif (mu is not None) and (sigma is not None):
+            mu = as_xtensor(mu)
+            sigma = as_xtensor(sigma)
+            # Use sign of sigma to not let negative sigma fly by
+            alpha = (mu**2 / sigma**2) * ptx.math.sign(sigma)
+            beta = mu / sigma**2
+        else:
+            raise ValueError(
+                "Incompatible parameterization. Either use alpha and beta, or mu and sigma."
+            )
+        alpha, beta = RegularGamma.get_alpha_beta(alpha=alpha, beta=beta, mu=mu, sigma=sigma)
+        return super().dist([alpha, ptx.math.reciprocal(beta)], **kwargs)
+
+
+@copy_docstring(regular_dists.Gumbel)
+class Gumbel(DimDistribution):
+    xrv_op = ptxr.gumbel
+
+    @classmethod
+    def dist(cls, mu, beta, **kwargs):
+        return super().dist([mu, beta], **kwargs)
+
+
+@copy_docstring(regular_dists.InverseGamma)
+class InverseGamma(PositiveDimDistribution):
+    xrv_op = ptxr.invgamma
+
+    @classmethod
+    def dist(cls, alpha=None, beta=None, *, mu=None, sigma=None, **kwargs):
+        if alpha is not None:
+            if beta is None:
+                beta = 1.0
+        elif (mu is not None) and (sigma is not None):
+            # Use sign of sigma to not let negative sigma fly by
+            mu = as_xtensor(mu)
+            sigma = as_xtensor(sigma)
+            alpha = ((2 * sigma**2 + mu**2) / sigma**2) * ptx.math.sign(sigma)
+            beta = mu * (mu**2 + sigma**2) / sigma**2
+        else:
+            raise ValueError(
+                "Incompatible parameterization. Either use alpha and (optionally) beta, or mu and sigma"
+            )
+        return super().dist([alpha, beta], **kwargs)
+
+
+@copy_docstring(regular_dists.Wald)
+class Wald(PositiveDimDistribution):
+    xrv_op = ptxr.as_xrv(wald)
+
+    @classmethod
+    def dist(cls, mu=None, lam=None, *, phi=None, alpha=0.0, **kwargs):
+        mu, lam, phi = RegularWald.get_mu_lam_phi(mu=mu, lam=lam, phi=phi)
+        return super().dist([mu, lam, alpha], **kwargs)
+
+
+@copy_docstring(regular_dists.Weibull)
+class Weibull(PositiveDimDistribution):
+    @classmethod
+    def dist(cls, alpha, beta, **kwargs):
+        return super().dist([alpha, beta], **kwargs)
+
+    @classmethod
+    def xrv_op(self, alpha, beta, core_dims=None, extra_dims=None, rng=None, **kwargs):
+        alpha = as_xtensor(alpha)
+        beta = as_xtensor(beta)
+        core_rv = WeibullBetaRV.rv_op(alpha=alpha.values, beta=beta.values).owner.op
+        xop = ptxr.as_xrv(core_rv)
+        return xop(alpha, beta, core_dims=core_dims, extra_dims=extra_dims, rng=rng, **kwargs)
+
+
+@copy_docstring(regular_dists.Pareto)
+class Pareto(PositiveDimDistribution):
+    def __new__(cls, name, alpha, m, default_transform=UNSET, observed=None, **kwargs):
+        if observed is None and default_transform is UNSET:
+            default_transform = IntervalTransform(m, float("inf"))
+        return super().__new__(
+            cls,
+            name,
+            alpha,
+            m,
+            default_transform=default_transform,
+            observed=observed,
+            **kwargs,
+        )
+
+    xrv_op = ptxr.pareto
+
+    @classmethod
+    def dist(cls, alpha, m, **kwargs):
+        return super().dist([alpha, m], **kwargs)
+
+
+@copy_docstring(regular_dists.Poisson)
+class Poisson(DimDistribution):
+    xrv_op = ptxr.poisson
+
+    @classmethod
+    def dist(cls, mu, **kwargs):
+        return super().dist([mu], **kwargs)
+
+
+@copy_docstring(regular_dists.NegativeBinomial)
+class NegativeBinomial(DimDistribution):
+    xrv_op = ptxr.nbinom
+
+    @classmethod
+    def dist(cls, mu=None, alpha=None, *, p=None, n=None, **kwargs):
+        n, p = RegularNegativeBinomial.get_n_p(mu=mu, alpha=alpha, p=p, n=n, math=ptx.math)
+        return super().dist([n, p], **kwargs)
+
+
+@copy_docstring(regular_dists.BetaBinomial)
+class BetaBinomial(DimDistribution):
+    xrv_op = ptxr.betabinom
+
+    @classmethod
+    def dist(cls, n, alpha, beta, **kwargs):
+        # Match the regular BetaBinomial, which casts n to int
+        n = as_xtensor(n).astype("int64")
+        return super().dist([n, alpha, beta], **kwargs)
+
+
+@copy_docstring(regular_dists.Bernoulli)
+class Bernoulli(DimDistribution):
+    xrv_op = ptxr.bernoulli
+
+    @classmethod
+    def dist(cls, p=None, logit_p=None, **kwargs):
+        if p is not None and logit_p is not None:
+            raise ValueError("Incompatible parametrization. Can't specify both p and logit_p.")
+        if p is None and logit_p is None:
+            raise ValueError("Incompatible parametrization. Must specify either p or logit_p.")
+        if logit_p is not None:
+            p = ptx.math.sigmoid(logit_p)
+        return super().dist([p], **kwargs)
+
+
+@copy_docstring(regular_dists.Binomial)
+class Binomial(DimDistribution):
+    xrv_op = ptxr.binomial
+
+    @classmethod
+    def dist(cls, n, p=None, logit_p=None, **kwargs):
+        if p is not None and logit_p is not None:
+            raise ValueError("Incompatible parametrization. Can't specify both p and logit_p.")
+        if p is None and logit_p is None:
+            raise ValueError("Incompatible parametrization. Must specify either p or logit_p.")
+        if logit_p is not None:
+            p = ptx.math.sigmoid(logit_p)
+        # Cast to int64 to match the dtype used by regular_dists.Binomial
+        n = ptx.math.cast(n, "int64")
+        return super().dist([n, p], **kwargs)
+
+
+@copy_docstring(regular_dists.Geometric)
+class Geometric(DimDistribution):
+    xrv_op = ptxr.geometric
+
+    @classmethod
+    def dist(cls, p, **kwargs):
+        return super().dist([p], **kwargs)
+
+
+@copy_docstring(regular_dists.HyperGeometric)
+class HyperGeometric(DimDistribution):
+    xrv_op = ptxr.hypergeometric
+
+    @classmethod
+    def dist(cls, N, k, n, **kwargs):
+        # Match the reference distribution, which casts the integer parameters to int64
+        # (as_xtensor would otherwise infer the smallest dtype, e.g. int8 for constants)
+        return super().dist(
+            [ptx.math.cast(k, "int64"), ptx.math.cast(N - k, "int64"), ptx.math.cast(n, "int64")],
+            **kwargs,
+        )
+
+
+@copy_docstring(regular_dists.DiracDelta)
+class DiracDelta(DimDistribution):
+    @classmethod
+    def dist(cls, c, **kwargs):
+        c = cls._as_xtensor(c)
+        if c.type.dtype in continuous_types:
+            c = floatX(c)
+        return super().dist([c], **kwargs)
+
+    @classmethod
+    def xrv_op(self, c, core_dims=None, extra_dims=None, rng=None, return_next_rng=False, **kwargs):
+        # DiracDeltaRV has no rng, so it can't be wrapped by the XRV machinery like the
+        # other scalar distributions. We build the regular RV and wrap it in an xtensor,
+        # relying on MeasurableXTensorFromTensor (see core.py) for the logp.
+        c = as_xtensor(c)
+        extra_dims = extra_dims or {}
+        out_dims = (*extra_dims.keys(), *c.dims)
+        c_tensor = c.values
+        if extra_dims:
+            size = [*extra_dims.values(), *(c_tensor.shape[i] for i in range(c_tensor.ndim))]
+            rv = DiracDeltaRV.rv_op(c_tensor, size=size)
+        else:
+            rv = DiracDeltaRV.rv_op(c_tensor)
+        xrv = xtensor_from_tensor(rv, dims=out_dims)
+        if return_next_rng:
+            return rng, xrv
+        return xrv
