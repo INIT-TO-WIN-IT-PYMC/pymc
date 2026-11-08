@@ -1,0 +1,570 @@
+#   Copyright 2024 - present The PyMC Developers
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+import re
+
+import numpy as np
+
+from pytensor.tensor.random import normal
+from rich.console import Console
+from rich.table import Table
+
+import pymc as pm
+
+from pymc import (
+    Bernoulli,
+    Censored,
+    CustomDist,
+    Data,
+    Exponential,
+    Gamma,
+    HalfCauchy,
+    Mixture,
+    StudentT,
+    Truncated,
+)
+from pymc.distributions import (
+    Dirichlet,
+    DirichletMultinomial,
+    HalfNormal,
+    KroneckerNormal,
+    MvNormal,
+    NegativeBinomial,
+    Normal,
+    Uniform,
+    ZeroInflatedPoisson,
+)
+from pymc.math import dot
+from pymc.model import Deterministic, Model, Potential
+from pymc.printing import model_table
+from pymc.pytensorf import floatX
+
+
+class BaseTestStrAndLatexRepr:
+    @staticmethod
+    def _latex_segments(tex: str) -> list[str]:
+        """Split a LaTeX repr on its separator (\\sim or =) into segments for substring checks."""
+        return [s for s in re.split(r"\\sim| = ", tex.strip("$")) if s.strip()]
+
+    def test__repr_latex_(self):
+        model_tex = self.model._repr_latex_()
+
+        # make sure each variable is in the model
+        for tex in self.expected[("latex", True)]:
+            for segment in self._latex_segments(tex):
+                assert segment in model_tex
+
+    def test_str_repr(self):
+        for str_format in self.formats:
+            model_text = self.model.str_repr(*str_format)
+            for text in self.expected[str_format]:
+                if str_format[0] == "latex":
+                    for segment in self._latex_segments(text):
+                        assert segment in model_text
+                else:
+                    assert text in model_text
+
+
+class TestMonolith(BaseTestStrAndLatexRepr):
+    def setup_class(self):
+        # True parameter values
+        alpha, sigma = 1, 1
+        beta = [1, 2.5]
+
+        # Size of dataset
+        size = 100
+
+        # Predictor variable
+        X = np.random.normal(size=(size, 2)).dot(np.array([[1, 0], [0, 0.2]]))
+
+        # Simulate outcome variable
+        Y = alpha + X.dot(beta) + np.random.randn(size) * sigma
+        with Model() as self.model:
+            # TODO: some variables commented out here as they're not working properly
+            # in v4 yet (9-jul-2021), so doesn't make sense to test str/latex for them
+
+            # Priors for unknown model parameters
+            alpha = Normal("alpha", mu=0, sigma=10)
+            b = Normal("beta", mu=0, sigma=10, size=(2,), observed=beta)
+            sigma = HalfNormal("sigma", sigma=1)
+
+            # Test Cholesky parameterization
+            Z = MvNormal("Z", mu=np.zeros(2), chol=np.eye(2), size=(2,))
+
+            # NegativeBinomial representations to test issue 4186
+            # nb1 = pm.NegativeBinomial(
+            #     "nb_with_mu_alpha", mu=pm.Normal("nbmu"), alpha=pm.Gamma("nbalpha", mu=6, sigma=1)
+            # )
+            nb2 = NegativeBinomial("nb_with_p_n", p=Uniform("nbp"), n=10)
+
+            # SymbolicRV
+            zip = ZeroInflatedPoisson("zip", 0.5, 5)
+
+            # Nested SymbolicRV
+            comp_1 = ZeroInflatedPoisson.dist(0.5, 5)
+            comp_2 = Censored.dist(Bernoulli.dist(0.5), -1, 1)
+            w = Dirichlet("w", [1, 1])
+            nested_mix = Mixture("nested_mix", w, [comp_1, comp_2])
+
+            # Expected value of outcome
+            mu = Deterministic("mu", floatX(alpha + dot(X, b)))
+
+            # KroneckerNormal
+            n, m = 3, 4
+            covs = [np.eye(n), np.eye(m)]
+            kron_normal = KroneckerNormal("kron_normal", mu=np.zeros(n * m), covs=covs, size=n * m)
+
+            # MatrixNormal
+            # matrix_normal = MatrixNormal(
+            #     "mat_normal",
+            #     mu=np.random.normal(size=n),
+            #     rowcov=np.eye(n),
+            #     colchol=np.linalg.cholesky(np.eye(n)),
+            #     size=(n, n),
+            # )
+
+            # DirichletMultinomial
+            dm = DirichletMultinomial("dm", n=5, a=[1, 1, 1], size=(2, 3))
+
+            # Likelihood (sampling distribution) of observations
+            Y_obs = Normal("Y_obs", mu=mu, sigma=sigma, observed=Y)
+
+            # add a potential as well
+            pot = Potential("pot", mu**2)
+
+            # add a deterministic that depends on an unnamed random variable
+            pred = Deterministic("pred", Normal.dist(0, 1))
+
+        self.distributions = [alpha, sigma, mu, b, Z, nb2, zip, w, nested_mix, Y_obs]
+        self.deterministics_or_potentials = [mu, pot, pred]
+        # tuples of (formatting, include_params)
+        self.formats = [("plain", True), ("plain", False), ("latex", True), ("latex", False)]
+        self.expected = {
+            ("plain", True): [
+                r"alpha ~ Normal(0, 10)",
+                r"sigma ~ HalfNormal(0, 1)",
+                r"mu = Deterministic(f(alpha, beta))",
+                r"beta ~ Normal(0, 10)",
+                r"Z ~ MultivariateNormal(<constant>, <constant>)",
+                r"nb_with_p_n ~ NegativeBinomial(10, nbp)",
+                r"zip ~ Mixture(<constant>, DiracDelta(0), Poisson(5))",
+                r"w ~ Dirichlet(<constant>)",
+                (
+                    r"nested_mix ~ Mixture(w, "
+                    r"Mixture(<constant>, DiracDelta(0), Poisson(5)), "
+                    r"Censored(Bernoulli(0.5), -1, 1))"
+                ),
+                r"Y_obs ~ Normal(mu, sigma)",
+                r"pot ~ Potential(f(mu))",
+                r"pred = Deterministic(f(<normal>))",
+            ],
+            ("plain", False): [
+                r"alpha ~ Normal",
+                r"sigma ~ HalfNormal",
+                r"mu = Deterministic",
+                r"beta ~ Normal",
+                r"Z ~ MultivariateNormal",
+                r"nb_with_p_n ~ NegativeBinomial",
+                r"zip ~ Mixture",
+                r"w ~ Dirichlet",
+                r"nested_mix ~ Mixture",
+                r"Y_obs ~ Normal",
+                r"pot ~ Potential",
+                r"pred = Deterministic",
+            ],
+            ("latex", True): [
+                r"$\text{alpha} \sim \operatorname{Normal}(0,~10)$",
+                r"$\text{sigma} \sim \operatorname{HalfNormal}(0,~1)$",
+                r"$\text{mu} = \operatorname{Deterministic}(f(\text{alpha},~\text{beta}))$",
+                r"$\text{beta} \sim \operatorname{Normal}(0,~10)$",
+                r"$\text{Z} \sim \operatorname{MultivariateNormal}(\text{<constant>},~\text{<constant>})$",
+                r"$\text{nb\_with\_p\_n} \sim \operatorname{NegativeBinomial}(10,~\text{nbp})$",
+                r"$\text{zip} \sim \operatorname{Mixture}(\text{<constant>},~\operatorname{DiracDelta}(0),~\operatorname{Poisson}(5))$",
+                r"$\text{w} \sim \operatorname{Dirichlet}(\text{<constant>})$",
+                (
+                    r"$\text{nested\_mix} \sim \operatorname{Mixture}(\text{w},"
+                    r"~\operatorname{Mixture}(\text{<constant>},~\operatorname{DiracDelta}(0),~\operatorname{Poisson}(5)),"
+                    r"~\operatorname{Censored}(\operatorname{Bernoulli}(0.5),~-1,~1))$"
+                ),
+                r"$\text{Y\_obs} \sim \operatorname{Normal}(\text{mu},~\text{sigma})$",
+                r"$\text{pot} \sim \operatorname{Potential}(f(\text{mu}))$",
+                r"$\text{pred} = \operatorname{Deterministic}(f(\text{<normal>}))",
+            ],
+            ("latex", False): [
+                r"$\text{alpha} \sim \operatorname{Normal}$",
+                r"$\text{sigma} \sim \operatorname{HalfNormal}$",
+                r"$\text{mu} = \operatorname{Deterministic}$",
+                r"$\text{beta} \sim \operatorname{Normal}$",
+                r"$\text{Z} \sim \operatorname{MultivariateNormal}$",
+                r"$\text{nb\_with\_p\_n} \sim \operatorname{NegativeBinomial}$",
+                r"$\text{zip} \sim \operatorname{Mixture}$",
+                r"$\text{w} \sim \operatorname{Dirichlet}$",
+                r"$\text{nested\_mix} \sim \operatorname{Mixture}$",
+                r"$\text{Y\_obs} \sim \operatorname{Normal}$",
+                r"$\text{pot} \sim \operatorname{Potential}$",
+                r"$\text{pred} = \operatorname{Deterministic}",
+            ],
+        }
+
+
+class TestData(BaseTestStrAndLatexRepr):
+    def setup_class(self):
+        with Model() as self.model:
+            import pymc as pm
+
+            with pm.Model() as model:
+                a = pm.Normal("a", pm.Data("a_data", (2,)))
+                b = pm.Normal("b", pm.Data("b_data", (2, 3)))
+                c = pm.Normal("c", pm.Data("c_data", (2,)))
+                d = pm.Normal("d", pm.Data("d_data", (2, 3)))
+
+        self.distributions = [a, b, c, d]
+        # tuples of (formatting, include_params)
+        self.formats = [("plain", True), ("plain", False), ("latex", True), ("latex", False)]
+        self.expected = {
+            ("plain", True): [
+                r"a ~ Normal(2, 1)",
+                r"b ~ Normal(<shared>, 1)",
+                r"c ~ Normal(2, 1)",
+                r"d ~ Normal(<shared>, 1)",
+            ],
+            ("plain", False): [
+                r"a ~ Normal",
+                r"b ~ Normal",
+                r"c ~ Normal",
+                r"d ~ Normal",
+            ],
+            ("latex", True): [
+                r"$\text{a} \sim \operatorname{Normal}(2,~1)$",
+                r"$\text{b} \sim \operatorname{Normal}(\text{<shared>},~1)$",
+                r"$\text{c} \sim \operatorname{Normal}(2,~1)$",
+                r"$\text{d} \sim \operatorname{Normal}(\text{<shared>},~1)$",
+            ],
+            ("latex", False): [
+                r"$\text{a} \sim \operatorname{Normal}$",
+                r"$\text{b} \sim \operatorname{Normal}$",
+                r"$\text{c} \sim \operatorname{Normal}$",
+                r"$\text{d} \sim \operatorname{Normal}$",
+            ],
+        }
+
+
+def test_model_latex_repr_three_levels_model():
+    with Model() as censored_model:
+        mu = Normal("mu", 0.0, 5.0)
+        sigma = HalfCauchy("sigma", 2.5)
+        normal_dist = Normal.dist(mu=mu, sigma=sigma)
+        censored_normal = Censored(
+            "censored_normal", normal_dist, lower=-2.0, upper=2.0, observed=[1, 0, 0.5]
+        )
+
+    latex_repr = censored_model.str_repr(formatting="latex")
+    expected = [
+        "$$",
+        "\\begin{array}{rcl}",
+        "\\text{mu} &\\sim & \\operatorname{Normal}(0,~5)\\\\\\text{sigma} &\\sim & "
+        "\\operatorname{HalfCauchy}(2.5)\\\\\\text{censored\\_normal} &\\sim & "
+        "\\operatorname{Censored}(\\operatorname{Normal}(\\text{mu},~\\text{sigma}),~-2,~2)",
+        "\\end{array}",
+        "$$",
+    ]
+    assert [line.strip() for line in latex_repr.split("\n")] == expected
+
+
+def test_model_latex_repr_mixture_model():
+    with Model() as mix_model:
+        w = Dirichlet("w", [1, 1])
+        mix = Mixture("mix", w=w, comp_dists=[Normal.dist(0.0, 5.0), StudentT.dist(7.0)])
+
+    latex_repr = mix_model.str_repr(formatting="latex")
+    expected = [
+        "$$",
+        "\\begin{array}{rcl}",
+        "\\text{w} &\\sim & "
+        "\\operatorname{Dirichlet}(\\text{<constant>})\\\\\\text{mix} &\\sim & "
+        "\\operatorname{Mixture}(\\text{w},~\\operatorname{Normal}(0,~5),~\\operatorname{StudentT}(7,~0,~1))",
+        "\\end{array}",
+        "$$",
+    ]
+    assert [line.strip() for line in latex_repr.split("\n")] == expected
+
+
+def test_model_repr_variables_without_monkey_patched_repr():
+    """Test that model repr does not rely on individual variables having the str_repr method monkey patched."""
+    x = normal(name="x")
+    assert not hasattr(x, "str_repr")
+
+    model = Model()
+    model.register_rv(x, "x")
+
+    str_repr = model.str_repr()
+    assert str_repr == "x ~ Normal(0, 1)"
+
+
+def test_truncated_repr():
+    with Model() as model:
+        x = Truncated("x", Gamma.dist(1, 1), lower=0, upper=20)
+
+    str_repr = model.str_repr(include_params=False)
+    assert str_repr == "x ~ TruncatedGamma"
+
+
+def test_custom_dist_repr():
+    with Model() as model:
+
+        def dist(mu, size):
+            return Normal.dist(mu, 1, size=size)
+
+        def random(rng, mu, size):
+            return rng.normal(mu, size=size)
+
+        x = CustomDist("x", 0, dist=dist, class_name="CustomDistNormal")
+        x = CustomDist("y", 0, random=random, class_name="CustomRandomNormal")
+
+    str_repr = model.str_repr(include_params=False)
+    assert str_repr == "\n".join(["x ~ CustomDistNormal", "y ~ CustomRandomNormal"])
+
+
+class TestDimsDist:
+    def setup_class(self):
+        from pymc.dims.distributions import Normal as DimsNormal
+        from pymc.dims.distributions import ZeroSumNormal as DimsZeroSumNormal
+
+        with Model(coords={"group": range(3), "obs": range(5)}) as self.model:
+            mu = DimsNormal("mu", 0, 10, dims=("group",))
+            sigma = DimsNormal("sigma", 0, 1)
+            zsn = DimsZeroSumNormal("zsn", sigma=1, core_dims="group")
+            DimsNormal("y", mu + zsn, sigma, dims=("obs", "group"))
+
+        self.expected = {
+            ("plain", True): [
+                r"mu ~ Normal(0, 10)",
+                r"sigma ~ Normal(0, 1)",
+                r"zsn ~ ZeroSumNormal(<constant>, <constant>)",
+                r"y ~ Normal(f(mu, zsn), sigma)",
+            ],
+            ("plain", False): [
+                r"mu ~ Normal",
+                r"sigma ~ Normal",
+                r"zsn ~ ZeroSumNormal",
+                r"y ~ Normal",
+            ],
+            ("latex", True): [
+                r"\text{mu} &\sim & \operatorname{Normal}(0,~10)",
+                r"\text{sigma} &\sim & \operatorname{Normal}(0,~1)",
+                r"\text{zsn} &\sim & \operatorname{ZeroSumNormal}(\text{<constant>},~\text{<constant>})",
+                r"\text{y} &\sim & \operatorname{Normal}(f(\text{mu},~\text{zsn}),~\text{sigma})",
+            ],
+            ("latex", False): [
+                r"\text{mu} &\sim & \operatorname{Normal}",
+                r"\text{sigma} &\sim & \operatorname{Normal}",
+                r"\text{zsn} &\sim & \operatorname{ZeroSumNormal}",
+                r"\text{y} &\sim & \operatorname{Normal}",
+            ],
+        }
+
+    def test_str_repr(self):
+        for formatting, include_params in [("plain", True), ("plain", False)]:
+            model_text = self.model.str_repr(formatting=formatting, include_params=include_params)
+            for text in self.expected[(formatting, include_params)]:
+                assert text in model_text
+
+    def test_latex_repr(self):
+        for formatting, include_params in [("latex", True), ("latex", False)]:
+            model_text = self.model.str_repr(formatting=formatting, include_params=include_params)
+            for text in self.expected[(formatting, include_params)]:
+                assert text in model_text
+
+
+def test_data_vars_in_model_repr():
+    """Data variables appear in model repr and in Deterministic dependency lists (issue #7536)."""
+    with Model() as model:
+        x = Data("x", 0)
+        y = Normal("y")
+        Deterministic("f", x + y)
+
+    text = model.str_repr()
+    assert "x = Data(0)" in text
+    assert "y ~ Normal(0, 1)" in text
+    assert "f = Deterministic(f(y, x))" in text
+
+    latex = model.str_repr(formatting="latex")
+    assert r"&= &\operatorname{Data}(0)" in latex
+    assert r"\text{x}" in latex
+
+
+def test_constant_only_expression_in_repr():
+    """Constant-only expressions show <constant> instead of f() (issue #7538)."""
+    with Model() as model:
+        Exponential("x", lam=2)
+
+    text = model.str_repr()
+    assert "f()" not in text
+    assert "x ~ Exponential(<constant>)" == text
+
+
+def test_data_var_repr_no_params():
+    """Data variable repr without params."""
+    with Model() as model:
+        x = Data("x", 5)
+        Normal("y", x)
+
+    text_no_params = model.str_repr(include_params=False)
+    assert "x = Data" in text_no_params
+    assert "y ~ Normal" in text_no_params
+
+
+def test_data_var_latex_underscore_escaping():
+    """Data variable names with underscores are escaped in LaTeX (direct call and model repr)."""
+    from pymc.printing import str_for_data_var
+
+    with Model() as model:
+        my_data = Data("my_data", 42)
+        Normal("y", my_data)
+
+    # Direct call
+    latex_with_params = str_for_data_var(my_data, formatting="latex", include_params=True)
+    assert r"my\_data" in latex_with_params
+    assert r"\operatorname{Data}(42)" in latex_with_params
+
+    latex_no_params = str_for_data_var(my_data, formatting="latex", include_params=False)
+    assert r"my\_data" in latex_no_params
+    assert r"\operatorname{Data}" in latex_no_params
+
+    # Via model repr
+    model_latex = model.str_repr(formatting="latex")
+    assert r"my\_data" in model_latex
+
+
+def test_function_of_named_var_in_repr():
+    """A non-constant expression should keep f(named_var) form in model repr."""
+    with Model() as model:
+        a = Normal("a")
+        Normal("b", mu=a * 2)
+
+    text = model.str_repr()
+    assert "b ~ Normal(f(a), 1)" in text
+
+
+class TestLatexRepr:
+    @staticmethod
+    def simple_model() -> Model:
+        with Model() as simple_model:
+            error = HalfNormal("error", 0.5)
+            alpha_a = Normal("alpha_a", 0, 1)
+            Normal("y", alpha_a, error)
+        return simple_model
+
+    def test_latex_escaped_underscore(self):
+        """
+        Ensures that all underscores in model variable names are properly escaped for LaTeX representation
+        """
+        model = self.simple_model()
+        model_str = model.str_repr(formatting="latex")
+        assert "\\_" in model_str
+        assert "_" not in model_str.replace("\\_", "")
+
+
+def table_to_text(table: Table, width: int = 80) -> str:
+    """Render a rich ``Table`` to a plain-text string at a fixed width."""
+    console = Console(width=width)
+    with console.capture() as capture:
+        console.print(table)
+    return capture.get()
+
+
+def test_model_table():
+    with pm.Model(coords={"trial": range(6), "subject": range(20)}) as model:
+        x_data = pm.Data("x_data", np.random.normal(size=(6, 20)), dims=("trial", "subject"))
+        y_data = pm.Data("y_data", np.random.normal(size=(6, 20)), dims=("trial", "subject"))
+
+        mu = pm.Normal("mu", mu=0, sigma=1)
+        sigma = pm.HalfNormal("sigma", sigma=1)
+        global_intercept = pm.Normal("global_intercept", mu=0, sigma=1)
+        intercept_subject = pm.Normal("intercept_subject", mu=0, sigma=1, shape=(20, 1))
+        beta_subject = pm.Normal("beta_subject", mu=mu, sigma=sigma, dims="subject")
+
+        mu_trial = pm.Deterministic(
+            "mu_trial",
+            global_intercept.squeeze() + intercept_subject + beta_subject * x_data,
+            dims=["trial", "subject"],
+        )
+        noise = pm.Exponential("noise", lam=1)
+        y = pm.Normal("y", mu=mu_trial, sigma=noise, observed=y_data, dims=("trial", "subject"))
+
+        pm.Potential("beta_subject_penalty", -pm.math.abs(beta_subject), dims="subject")
+
+    table_txt = table_to_text(model_table(model))
+    expected = """               Variable  Expression                      Dimensions
+────────────────────────────────────────────────────────────────────────────────
+               x_data =  Data                            trial[6] × subject[20]
+               y_data =  Data                            trial[6] × subject[20]
+
+                   mu ~  Normal(0, 1)
+                sigma ~  HalfNormal(0, 1)
+     global_intercept ~  Normal(0, 1)
+    intercept_subject ~  Normal(0, 1)                    [20, 1]
+         beta_subject ~  Normal(mu, sigma)               subject[20]
+                noise ~  Exponential(<constant>)
+                                                         Parameter count = 44
+
+             mu_trial =  f(x_data, intercept_subject,    trial[6] × subject[20]
+                         beta_subject,
+                         global_intercept)
+
+ beta_subject_penalty =  Potential(f(beta_subject))      subject[20]
+
+                    y ~  Normal(mu_trial, noise)         trial[6] × subject[20]
+"""
+    assert [s.strip() for s in table_txt.splitlines()] == [s.strip() for s in expected.splitlines()]
+
+    table_txt = table_to_text(model_table(model, split_groups=False))
+    expected = """               Variable  Expression                      Dimensions
+────────────────────────────────────────────────────────────────────────────────
+               x_data =  Data                            trial[6] × subject[20]
+               y_data =  Data                            trial[6] × subject[20]
+                   mu ~  Normal(0, 1)
+                sigma ~  HalfNormal(0, 1)
+     global_intercept ~  Normal(0, 1)
+    intercept_subject ~  Normal(0, 1)                    [20, 1]
+         beta_subject ~  Normal(mu, sigma)               subject[20]
+             mu_trial =  f(x_data, intercept_subject,    trial[6] × subject[20]
+                         beta_subject,
+                         global_intercept)
+                noise ~  Exponential(<constant>)
+                    y ~  Normal(mu_trial, noise)         trial[6] × subject[20]
+ beta_subject_penalty =  Potential(f(beta_subject))      subject[20]
+                                                         Parameter count = 44
+"""
+    assert [s.strip() for s in table_txt.splitlines()] == [s.strip() for s in expected.splitlines()]
+
+    table_txt = table_to_text(
+        model_table(model, split_groups=False, truncate_deterministic=30, parameter_count=False)
+    )
+    expected = """               Variable  Expression                      Dimensions
+────────────────────────────────────────────────────────────────────────────────
+               x_data =  Data                            trial[6] × subject[20]
+               y_data =  Data                            trial[6] × subject[20]
+                   mu ~  Normal(0, 1)
+                sigma ~  HalfNormal(0, 1)
+     global_intercept ~  Normal(0, 1)
+    intercept_subject ~  Normal(0, 1)                    [20, 1]
+         beta_subject ~  Normal(mu, sigma)               subject[20]
+             mu_trial =  f(x_data, intercept_subject,    trial[6] × subject[20]
+                         ...)
+                noise ~  Exponential(<constant>)
+                    y ~  Normal(mu_trial, noise)         trial[6] × subject[20]
+ beta_subject_penalty =  Potential(f(beta_subject))      subject[20]
+"""
+    assert [s.strip() for s in table_txt.splitlines()] == [s.strip() for s in expected.splitlines()]

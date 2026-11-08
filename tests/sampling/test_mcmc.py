@@ -1,0 +1,1179 @@
+#   Copyright 2024 - present The PyMC Developers
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+import logging
+import unittest.mock as mock
+import warnings
+
+from contextlib import ExitStack as does_not_raise
+
+import numpy as np
+import numpy.testing as npt
+import pytensor
+import pytensor.tensor as pt
+import pytest
+import scipy.special
+
+from pytensor import shared
+from pytensor.compile.ops import wrap_py
+from xarray import DataTree
+
+import pymc as pm
+
+from pymc.backends.ndarray import NDArray
+from pymc.distributions import transforms
+from pymc.exceptions import SamplingError
+from pymc.sampling.mcmc import assign_step_methods, get_default_tune_steps
+from pymc.stats.convergence import SamplerWarning, WarningType
+from pymc.step_methods import (
+    NUTS,
+    STEP_METHODS,
+    BinaryGibbsMetropolis,
+    CategoricalGibbsMetropolis,
+    CompoundStep,
+    DEMetropolis,
+    HamiltonianMC,
+    Metropolis,
+    Slice,
+)
+from pymc.testing import fast_unstable_sampling_mode
+from tests.models import simple_init
+
+
+class TestInitNuts:
+    def setup_method(self):
+        self.model, self.start, self.step, _ = simple_init()
+
+    def test_checks_seeds_kwarg(self):
+        with self.model:
+            with pytest.raises(ValueError, match="Number of seeds"):
+                pm.sampling.mcmc.init_nuts(chains=2, random_seed=[1])
+
+
+class TestSample:
+    def setup_method(self):
+        self.model, self.start, self.step, _ = simple_init()
+
+    @pytest.mark.parametrize("init", ("jitter+adapt_diag", "advi", "jitter+map"))
+    @pytest.mark.parametrize("cores", (1, 2))
+    @pytest.mark.parametrize(
+        "chains, seeds",
+        [
+            (1, None),
+            (1, 1),
+            (1, [1]),
+            (2, None),
+            (2, 1),
+            (2, [1, 2]),
+        ],
+    )
+    def test_random_seed(self, chains, seeds, cores, init):
+        with pm.Model():
+            x = pm.Normal("x", 0, 10, initval="prior")
+            with pytest.warns(FutureWarning, match="return_inferencedata=False"):
+                tr1 = pm.sample(
+                    chains=chains,
+                    random_seed=seeds,
+                    cores=cores,
+                    init=init,
+                    tune=0,
+                    draws=10,
+                    return_inferencedata=False,
+                    compute_convergence_checks=False,
+                )
+                tr2 = pm.sample(
+                    chains=chains,
+                    random_seed=seeds,
+                    cores=cores,
+                    init=init,
+                    tune=0,
+                    draws=10,
+                    return_inferencedata=False,
+                    compute_convergence_checks=False,
+                )
+
+        allequal = np.all(tr1["x"] == tr2["x"])
+        if seeds is None:
+            assert not allequal
+        else:
+            assert allequal
+
+    @mock.patch("numpy.random.seed")
+    def test_default_sample_does_not_set_global_seed(self, mocked_seed):
+        # Test that when random_seed is None, `np.random.seed` is not called in the main
+        # process. Ideally it would never be called, but PyMC step samplers still rely
+        # on global seeding for reproducible behavior.
+        kwargs = {"tune": 2, "draws": 2, "random_seed": None}
+        with self.model:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                pm.sample(chains=1, **kwargs)
+                pm.sample(chains=2, cores=1, **kwargs)
+                pm.sample(chains=2, cores=2, **kwargs)
+        mocked_seed.assert_not_called()
+
+    def test_sample_does_not_rely_on_external_global_seeding(self):
+        # Tests that sampling does not depend on exertenal global seeding
+        kwargs = {
+            "tune": 2,
+            "draws": 20,
+            "random_seed": None,
+            "return_inferencedata": False,
+        }
+        with self.model:
+            with (
+                warnings.catch_warnings(),
+                pytest.warns(FutureWarning, match="return_inferencedata=False"),
+            ):
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                np.random.seed(1)
+                idata11 = pm.sample(chains=1, **kwargs)
+                np.random.seed(1)
+                idata12 = pm.sample(chains=2, cores=1, **kwargs)
+                np.random.seed(1)
+                idata13 = pm.sample(chains=2, cores=2, **kwargs)
+
+                np.random.seed(1)
+                idata21 = pm.sample(chains=1, **kwargs)
+                np.random.seed(1)
+                idata22 = pm.sample(chains=2, cores=1, **kwargs)
+                np.random.seed(1)
+                idata23 = pm.sample(chains=2, cores=2, **kwargs)
+
+        assert np.all(idata11["x"] != idata21["x"])
+        assert np.all(idata12["x"] != idata22["x"])
+        assert np.all(idata13["x"] != idata23["x"])
+
+    @pytest.mark.parametrize(
+        "init",
+        (
+            "advi",
+            "advi_map",
+            "map",
+            "jitter+map",
+            "adapt_diag",
+            "jitter+adapt_diag",
+            "jitter+adapt_diag_grad",
+            "adapt_full",
+            "jitter+adapt_full",
+        ),
+    )
+    def test_sample_init(self, init):
+        with self.model:
+            kwargs = {
+                "init": init,
+                "tune": 120,
+                "n_init": 1000,
+                "draws": 50,
+                "random_seed": 20160911,
+            }
+            with warnings.catch_warnings(record=True) as rec:
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                if init.endswith("adapt_full"):
+                    with pytest.warns(UserWarning, match="experimental feature"):
+                        pm.sample(**kwargs, cores=1)
+                else:
+                    pm.sample(**kwargs, cores=1)
+
+    def test_sample_args(self):
+        with self.model:
+            with pytest.raises(ValueError, match=r"'foo'"):
+                pm.sample(50, tune=0, chains=1, step=pm.Metropolis(), foo=1)
+
+            with pytest.raises(ValueError, match=r"'foo'") as excinfo:
+                pm.sample(50, tune=0, chains=1, step=pm.Metropolis(), foo={})
+
+    def test_parallel_start(self):
+        with self.model:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                idata = pm.sample(
+                    0,
+                    tune=5,
+                    cores=2,
+                    discard_tuned_samples=False,
+                    initvals=[{"x": [10, 10]}, {"x": [-10, -10]}],
+                    random_seed=20160911,
+                )
+        assert idata.warmup_posterior["x"].sel(chain=0, draw=0).values[0] > 0
+        assert idata.warmup_posterior["x"].sel(chain=1, draw=0).values[0] < 0
+
+    def test_reset_tuning(self):
+        with self.model:
+            tune = 50
+            chains = 2
+            start, step = pm.sampling.mcmc.init_nuts(chains=chains, random_seed=[1, 2])
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                pm.sample(draws=2, tune=tune, chains=chains, step=step, initvals=start, cores=1)
+            assert step.potential._n_samples == tune
+            assert step.step_adapt._count == tune + 1
+
+    @pytest.mark.parametrize(
+        "start, error",
+        [
+            ({"x": 1}, ValueError),
+            ({"x": [1, 2, 3]}, ValueError),
+            ({"x": np.array([[1, 1], [1, 1]])}, ValueError),
+        ],
+    )
+    def test_sample_start_bad_shape(self, start, error):
+        with pytest.raises(error):
+            pm.sampling.mcmc._check_start_shape(self.model, start)
+
+    @pytest.mark.parametrize("start", [{"x": np.array([1, 1])}, {"x": [10, 10]}, {"x": [-10, -10]}])
+    def test_sample_start_good_shape(self, start):
+        pm.sampling.mcmc._check_start_shape(self.model, start)
+
+    def test_sample_callback(self):
+        callback = mock.Mock()
+        test_cores = [1, 2]
+        with self.model:
+            for cores in test_cores:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                    pm.sample(
+                        10,
+                        tune=0,
+                        chains=2,
+                        step=self.step,
+                        cores=cores,
+                        random_seed=20160911,
+                        callback=callback,
+                    )
+                assert callback.called
+
+    def test_callback_can_cancel(self):
+        trace_cancel_length = 5
+
+        def callback(trace, draw):
+            if len(trace) >= trace_cancel_length:
+                raise KeyboardInterrupt()
+
+        with self.model:
+            with (
+                warnings.catch_warnings(),
+                pytest.warns(FutureWarning, match="return_inferencedata=False"),
+            ):
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                trace = pm.sample(
+                    10,
+                    tune=0,
+                    chains=1,
+                    step=self.step,
+                    cores=1,
+                    random_seed=2016911,
+                    callback=callback,
+                    return_inferencedata=False,
+                )
+            assert len(trace) == trace_cancel_length
+
+    def test_sequential_backend(self):
+        with self.model:
+            backend = NDArray()
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                pm.sample(10, tune=5, cores=1, chains=2, step=pm.Metropolis(), trace=backend)
+
+    @pytest.mark.parametrize("symbolic_rv", (False, True))
+    def test_deterministic_of_unobserved(self, symbolic_rv):
+        with pm.Model() as model:
+            if symbolic_rv:
+                x = pm.Censored(
+                    "x", pm.HalfNormal.dist(1), lower=None, upper=10, transform=transforms.log
+                )
+            else:
+                x = pm.HalfNormal("x", 1)
+            y = pm.Deterministic("y", x + 100)
+            idata = pm.sample(
+                chains=1,
+                tune=10,
+                draws=50,
+                compute_convergence_checks=False,
+            )
+
+        np.testing.assert_allclose(idata.posterior["y"], idata.posterior["x"] + 100)
+
+    @pytest.mark.parametrize("symbolic_rv", (False, True))
+    def test_transform_with_rv_dependency(self, symbolic_rv):
+        # Test that untransformed variables that depend on upstream variables are properly handled
+        with pm.Model() as m:
+            if symbolic_rv:
+                x = pm.Censored("x", pm.HalfNormal.dist(1), lower=0, upper=1, observed=1)
+            else:
+                x = pm.HalfNormal("x", observed=1)
+
+            transform = pm.distributions.transforms.Interval(
+                bounds_fn=lambda *inputs: (inputs[-2], inputs[-1])
+            )
+            y = pm.Uniform("y", lower=0, upper=x, transform=transform, default_transform=None)
+            with (
+                warnings.catch_warnings(),
+                pytest.warns(FutureWarning, match="return_inferencedata=False"),
+            ):
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                trace = pm.sample(tune=10, draws=50, return_inferencedata=False, random_seed=336)
+
+        assert np.allclose(scipy.special.expit(trace["y_interval__"]), trace["y"])
+
+
+class ApocalypticMetropolis(pm.Metropolis):
+    """A stepper that warns in every iteration."""
+
+    stats_dtypes_shapes = {
+        **pm.Metropolis.stats_dtypes_shapes,
+        "warning": (SamplerWarning, None),
+    }
+
+    def astep(self, q0):
+        draw, stats = super().astep(q0)
+        stats[0]["warning"] = SamplerWarning(
+            WarningType.BAD_ENERGY,
+            "Asteroid incoming!",
+            "warn",
+        )
+        return draw, stats
+
+
+_SETUP_CHAIN_STATS = {
+    "setup_tune": (np.int64, []),
+    "setup_draws": (np.int64, []),
+}
+
+
+class SetupChainReporter:
+    """Mixin reporting the ``tune`` and ``draws`` passed to `setup_chain` as sampler stats.
+
+    Stats are used because they are the only channel that survives the round-trip
+    back from the worker processes of the multiprocess sampler.
+    """
+
+    def setup_chain(self, rng, tune, draws):
+        super().setup_chain(rng, tune, draws)
+        self._setup_tune = tune
+        self._setup_draws = draws
+
+    def astep(self, q0):
+        draw, stats = super().astep(q0)
+        stats[0]["setup_tune"] = self._setup_tune
+        stats[0]["setup_draws"] = self._setup_draws
+        return draw, stats
+
+
+class SetupChainMetropolis(SetupChainReporter, Metropolis):
+    stats_dtypes_shapes = {**Metropolis.stats_dtypes_shapes, **_SETUP_CHAIN_STATS}
+
+
+class SetupChainDEMetropolis(SetupChainReporter, DEMetropolis):
+    stats_dtypes_shapes = {**DEMetropolis.stats_dtypes_shapes, **_SETUP_CHAIN_STATS}
+
+
+@pytest.mark.parametrize(
+    "step_cls, chains, cores",
+    [
+        (SetupChainMetropolis, 1, 1),
+        (SetupChainMetropolis, 2, 2),
+        (SetupChainDEMetropolis, 4, 1),
+    ],
+    ids=["sequential", "multiprocess", "population"],
+)
+def test_setup_chain_receives_draw_counts(step_cls, chains, cores):
+    """Each sampling path must report `tune` and `draws` separately, not double-subtract."""
+    with pm.Model():
+        pm.Normal("x")
+        idata = pm.sample(
+            draws=7,
+            tune=3,
+            chains=chains,
+            cores=cores,
+            step=step_cls(),
+            progressbar=False,
+            compute_convergence_checks=False,
+        )
+
+    assert (idata.sample_stats["setup_tune"] == 3).all()
+    assert (idata.sample_stats["setup_draws"] == 7).all()
+
+
+class TestSampleReturn:
+    """Tests related to kwargs that parametrize how `pm.sample` results are returned."""
+
+    def test_sample_return_lengths(self):
+        with pm.Model() as model:
+            pm.Normal("n")
+
+            # Get a MultiTrace with warmup
+            with (
+                pytest.warns(UserWarning, match="will be included"),
+                pytest.warns(FutureWarning, match="return_inferencedata=False"),
+            ):
+                mtrace = pm.sample(
+                    draws=100,
+                    tune=50,
+                    cores=1,
+                    chains=3,
+                    step=pm.Metropolis(),
+                    return_inferencedata=False,
+                    discard_tuned_samples=False,
+                )
+                assert isinstance(mtrace, pm.backends.base.MultiTrace)
+                assert len(mtrace) == 150
+
+        # Now instead of running more MCMCs, we'll test the other return
+        # options using the basetraces inside the MultiTrace.
+        traces = list(mtrace._straces.values())
+        assert len(traces) == 3
+
+        # MultiTrace without warmup
+        mtrace_pst = pm.sampling.mcmc._sample_return(
+            run=None,
+            traces=traces,
+            tune=50,
+            t_sampling=123.4,
+            discard_tuned_samples=True,
+            return_inferencedata=False,
+            compute_convergence_checks=False,
+            keep_warning_stat=True,
+            idata_kwargs={},
+            model=model,
+        )
+        assert isinstance(mtrace_pst, pm.backends.base.MultiTrace)
+        assert len(mtrace_pst) == 100
+        assert mtrace_pst.report.t_sampling == 123.4
+        assert mtrace_pst.report.n_tune == 50
+        assert mtrace_pst.report.n_draws == 100
+
+        # DataTree with warmup
+        idata_w = pm.sampling.mcmc._sample_return(
+            run=None,
+            traces=traces,
+            tune=50,
+            t_sampling=123.4,
+            discard_tuned_samples=False,
+            compute_convergence_checks=False,
+            return_inferencedata=True,
+            keep_warning_stat=True,
+            idata_kwargs={},
+            model=model,
+        )
+        assert isinstance(idata_w, DataTree)
+        assert hasattr(idata_w, "warmup_posterior")
+        assert idata_w.warmup_posterior.sizes["draw"] == 50
+        assert idata_w.posterior.sizes["draw"] == 100
+        assert idata_w.posterior.sizes["chain"] == 3
+
+        # DataTree without warmup
+        idata = pm.sampling.mcmc._sample_return(
+            run=None,
+            traces=traces,
+            tune=50,
+            t_sampling=123.4,
+            discard_tuned_samples=True,
+            compute_convergence_checks=False,
+            return_inferencedata=True,
+            keep_warning_stat=False,
+            idata_kwargs={},
+            model=model,
+        )
+        assert isinstance(idata, DataTree)
+        assert not hasattr(idata, "warmup_posterior")
+        assert idata.posterior.sizes["draw"] == 100
+        assert idata.posterior.sizes["chain"] == 3
+
+    def test_categorical_gibbs_respects_driver_tune_boundary(self):
+        with pm.Model():
+            pm.Categorical("x", p=np.array([0.2, 0.3, 0.5]))
+            sample_kwargs = {
+                "tune": 5,
+                "draws": 7,
+                "chains": 1,
+                "cores": 1,
+                "return_inferencedata": False,
+                "compute_convergence_checks": False,
+                "progressbar": False,
+                "random_seed": 123,
+            }
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                mtrace = pm.sample(discard_tuned_samples=True, **sample_kwargs)
+            assert len(mtrace) == 7
+            assert mtrace.report.n_tune == 5
+            assert mtrace.report.n_draws == 7
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                with pytest.warns(UserWarning, match="will be included"):
+                    mtrace_warmup = pm.sample(discard_tuned_samples=False, **sample_kwargs)
+            assert len(mtrace_warmup) == 12
+            assert mtrace_warmup.report.n_tune == 5
+            assert mtrace_warmup.report.n_draws == 7
+
+    @pytest.mark.parametrize("cores", [1, 2])
+    def test_logs_sampler_warnings(self, caplog, cores):
+        """Asserts that "warning" sampler stats are logged during sampling."""
+        with pm.Model():
+            pm.Normal("n")
+            with caplog.at_level(logging.WARNING):
+                idata = pm.sample(
+                    tune=2,
+                    draws=3,
+                    cores=cores,
+                    chains=cores,
+                    step=ApocalypticMetropolis(),
+                    compute_convergence_checks=False,
+                    discard_tuned_samples=False,
+                    keep_warning_stat=True,
+                )
+
+        # Sampler warnings should be logged
+        nwarns = sum("Asteroid" in rec.message for rec in caplog.records)
+        assert nwarns == (2 + 3) * cores
+
+    @pytest.mark.parametrize("keep_warning_stat", [None, True])
+    def test_keep_warning_stat_setting(self, keep_warning_stat):
+        """The ``keep_warning_stat`` stat (aka "Adrian's kwarg) enables users
+        to keep the ``SamplerWarning`` objects from the ``sample_stats.warning`` group.
+        This breaks ``idata.to_netcdf()`` which is why it defaults to ``False``.
+        """
+        sample_kwargs = {
+            "tune": 2,
+            "draws": 3,
+            "chains": 1,
+            "compute_convergence_checks": False,
+            "discard_tuned_samples": False,
+            "keep_warning_stat": keep_warning_stat,
+        }
+        if keep_warning_stat:
+            sample_kwargs["keep_warning_stat"] = True
+        with pm.Model():
+            pm.Normal("n")
+            idata = pm.sample(step=ApocalypticMetropolis(), **sample_kwargs)
+
+        if keep_warning_stat:
+            assert "warning" in idata.warmup_sample_stats
+            assert "warning" in idata.sample_stats
+            # And end up in the DataTree
+            assert "warning" in idata.sample_stats
+            # NOTE: The stats are squeezed by default but this does not always work.
+            #       This tests flattens so we don't have to be exact in accessing (non-)squeezed items.
+            #       Also see https://github.com/pymc-devs/pymc/issues/6207.
+            warn_objs = list(idata.sample_stats.warning.sel(chain=0).values.flatten())
+            assert warn_objs
+            if isinstance(warn_objs[0], np.ndarray):
+                # Squeeze warning stats. See https://github.com/pymc-devs/pymc/issues/6207
+                warn_objs = [a.tolist() for a in warn_objs]
+            assert any(isinstance(w, SamplerWarning) for w in warn_objs)
+            assert any("Asteroid" in w.message for w in warn_objs)
+        else:
+            assert "warning" not in idata.warmup_sample_stats
+            assert "warning" not in idata.sample_stats
+            assert "warning_dim_0" not in idata.warmup_sample_stats
+            assert "warning_dim_0" not in idata.sample_stats
+
+
+def test_sample_find_MAP_does_not_modify_start():
+    # see https://github.com/pymc-devs/pymc/pull/4458
+    with pm.Model():
+        pm.LogNormal("untransformed")
+
+        # make sure find_Map does not modify the start dict
+        start = {"untransformed": 2}
+        pm.find_MAP(initvals=start, jitter=False, return_inferencedata=True, progressbar=False)
+        assert start == {"untransformed": 2}
+
+        # make sure sample does not modify the start dict
+        start = {"untransformed": 0.2}
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+            pm.sample(draws=10, step=pm.Metropolis(), tune=5, initvals=start, chains=3)
+        assert start == {"untransformed": 0.2}
+
+        # make sure sample does not modify the start when passes as list of dict
+        start = [{"untransformed": 2}, {"untransformed": 0.2}]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+            pm.sample(draws=10, step=pm.Metropolis(), tune=5, initvals=start, chains=2)
+        assert start == [{"untransformed": 2}, {"untransformed": 0.2}]
+
+
+def test_empty_model():
+    with pm.Model():
+        pm.Normal("a", observed=1)
+        with pytest.raises(SamplingError) as error:
+            pm.sample()
+        error.match("any free variables")
+
+
+def test_blas_cores():
+    with pm.Model():
+        pm.Normal("a")
+        pm.sample(blas_cores="auto", tune=10, cores=2, draws=10)
+        pm.sample(blas_cores=None, tune=10, cores=2, draws=10)
+        pm.sample(blas_cores=2, tune=10, cores=2, draws=10)
+
+
+def test_partial_trace_with_trace_unsupported():
+    with pm.Model() as model:
+        a = pm.Normal("a", mu=0, sigma=1)
+        b = pm.Normal("b", mu=0, sigma=1)
+        with pytest.raises(ValueError, match="var_names"):
+            pm.sample(trace=[a])
+
+
+class TestNamedSampling:
+    def test_shared_named(self):
+        G_var = shared(value=np.atleast_2d(1.0), shape=(1, None), name="G")
+
+        with pm.Model():
+            theta0 = pm.Normal(
+                "theta0",
+                mu=np.atleast_2d(0),
+                tau=np.atleast_2d(1e20),
+                size=(1, 1),
+            )
+            theta = pm.Normal(
+                "theta", mu=pt.dot(G_var, theta0), tau=np.atleast_2d(1e20), size=(1, 1)
+            )
+            res = theta.eval()
+            assert np.isclose(res, 0.0)
+
+    def test_shared_unnamed(self):
+        G_var = shared(value=np.atleast_2d(1.0), shape=(1, None))
+        with pm.Model():
+            theta0 = pm.Normal(
+                "theta0",
+                mu=np.atleast_2d(0),
+                tau=np.atleast_2d(1e20),
+                size=(1, 1),
+            )
+            theta = pm.Normal(
+                "theta", mu=pt.dot(G_var, theta0), tau=np.atleast_2d(1e20), size=(1, 1)
+            )
+            res = theta.eval()
+            assert np.isclose(res, 0.0)
+
+    def test_constant_named(self):
+        G_var = pt.constant(np.atleast_2d(1.0), name="G")
+        with pm.Model():
+            theta0 = pm.Normal(
+                "theta0",
+                mu=np.atleast_2d(0),
+                tau=np.atleast_2d(1e20),
+                size=(1, 1),
+            )
+            theta = pm.Normal(
+                "theta", mu=pt.dot(G_var, theta0), tau=np.atleast_2d(1e20), size=(1, 1)
+            )
+
+            res = theta.eval()
+            assert np.isclose(res, 0.0)
+
+
+def check_exec_nuts_init(method):
+    with pm.Model() as model:
+        pm.Normal("a", mu=0, sigma=1, size=2)
+        pm.HalfNormal("b", sigma=1)
+    with model:
+        start, _ = pm.init_nuts(init=method, n_init=10, random_seed=[1])
+        assert isinstance(start, list)
+        assert len(start) == 1
+        assert isinstance(start[0], dict)
+        assert set(start[0].keys()) == {v.name for v in model.value_vars}
+        start, _ = pm.init_nuts(init=method, n_init=10, chains=2, random_seed=[1, 2])
+        assert isinstance(start, list)
+        assert len(start) == 2
+        assert isinstance(start[0], dict)
+        assert set(start[0].keys()) == {v.name for v in model.value_vars}
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "advi",
+        "ADVI+adapt_diag",
+        "advi_map",
+        "jitter+adapt_diag",
+        "adapt_diag",
+        "map",
+        "jitter+map",
+        "adapt_full",
+        "jitter+adapt_full",
+    ],
+)
+def test_exec_nuts_init(method):
+    if method.endswith("adapt_full"):
+        with pytest.warns(UserWarning, match="experimental feature"):
+            check_exec_nuts_init(method)
+    else:
+        check_exec_nuts_init(method)
+
+
+def test_init_map_jitter_and_initvals(monkeypatch):
+    calls = []
+    find_map_point = pm.sampling.mcmc._find_MAP_point
+    monkeypatch.setattr(
+        pm.sampling.mcmc,
+        "_find_MAP_point",
+        lambda **kwargs: calls.append(kwargs) or find_map_point(**kwargs),
+    )
+    for init in ("map", "jitter+map", "advi_map"):
+        check_exec_nuts_init(init)
+    assert [c["jitter"] for c in calls] == [False, False, True, True, False, False]
+
+    calls.clear()
+    with pm.Model():
+        pm.Normal("a")
+        pm.init_nuts(init="map", initvals={"a": 2.0}, random_seed=[1])
+        pm.init_nuts(init="map", initvals=[{"a": 3.0}, {"a": 4.0}], chains=2, random_seed=[1, 2])
+    assert [c["initvals"] for c in calls] == [{"a": 2.0}, {"a": 3.0}]
+
+
+@pytest.mark.skip(reason="Test requires monkey patching of RandomGenerator")
+@pytest.mark.parametrize(
+    "initval, jitter_max_retries, expectation",
+    [
+        (0, 0, pytest.raises(SamplingError)),
+        (0, 1, pytest.raises(SamplingError)),
+        (0, 4, does_not_raise()),
+        (0, 10, does_not_raise()),
+        (1, 0, does_not_raise()),
+    ],
+)
+def test_init_jitter(initval, jitter_max_retries, expectation):
+    with pm.Model() as m:
+        pm.HalfNormal("x", default_transform=None, initval=initval)
+
+    with expectation:
+        # Starting value is negative (invalid) when np.random.rand returns 0 (jitter = -1)
+        # and positive (valid) when it returns 1 (jitter = 1)
+        with mock.patch("numpy.random.Generator.uniform", side_effect=[-1, -1, -1, 1, -1]):
+            start = pm.sampling.mcmc._init_jitter(
+                model=m,
+                initvals=None,
+                seeds=[1],
+                jitter=True,
+                jitter_max_retries=jitter_max_retries,
+            )
+            m.check_start_vals(start)
+
+
+def test_step_args():
+    # pymc-NUTS names it `acceptance_rate`, nutpie names it `mean_tree_accept`.
+    def accept(idata):
+        stats = idata.sample_stats
+        return stats.acceptance_rate if "acceptance_rate" in stats else stats.mean_tree_accept
+
+    with pm.Model() as model:
+        a = pm.Normal("a")
+        idata_default = pm.sample(draws=200, tune=200, random_seed=1410)
+        idata0 = pm.sample(draws=200, tune=200, target_accept=0.5, random_seed=1410)
+        idata1 = pm.sample(draws=200, tune=200, nuts={"target_accept": 0.5}, random_seed=1410 * 2)
+        idata2 = pm.sample(
+            draws=200, tune=200, target_accept=0.5, nuts={"max_treedepth": 10}, random_seed=1410
+        )
+
+        with pytest.raises(ValueError, match="`target_accept` was defined twice."):
+            pm.sample(target_accept=0.5, nuts={"target_accept": 0.95}, random_seed=1410)
+
+    # Negative control: default target_accept (0.8) must land far from 0.5, so the
+    # positive assertions below can only pass when `target_accept=0.5` was honored.
+    assert accept(idata_default).mean() > 0.6
+    npt.assert_almost_equal(accept(idata0).mean(), 0.5, decimal=1)
+    npt.assert_almost_equal(accept(idata1).mean(), 0.5, decimal=1)
+    npt.assert_almost_equal(accept(idata2).mean(), 0.5, decimal=1)
+
+    with pm.Model() as model:
+        a = pm.Normal("a")
+        b = pm.Poisson("b", 1)
+        idata0 = pm.sample(draws=200, tune=200, target_accept=0.5, random_seed=1418)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", "invalid value encountered in double_scalars", RuntimeWarning
+            )
+            idata1 = pm.sample(
+                draws=200,
+                tune=200,
+                nuts={"target_accept": 0.5},
+                metropolis={"scaling": 0},
+                random_seed=1418 * 2,
+            )
+
+    npt.assert_almost_equal(accept(idata0).mean(), 0.5, decimal=1)
+    npt.assert_almost_equal(accept(idata1).mean(), 0.5, decimal=1)
+    npt.assert_allclose(idata1.sample_stats.scaling, 0)
+
+
+def test_init_nuts(caplog):
+    with pm.Model() as model:
+        a = pm.Normal("a")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+            # `init_nuts` is a pymc-sampler-only code path.
+            pm.sample(10, tune=10, nuts_sampler="pymc")
+        assert "Initializing NUTS" in caplog.text
+
+
+def test_no_init_nuts_step(caplog):
+    with pm.Model() as model:
+        a = pm.Normal("a")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+            pm.sample(10, tune=10, step=pm.NUTS([a]))
+        assert "Initializing NUTS" not in caplog.text
+
+
+def test_no_init_nuts_compound(caplog):
+    with pm.Model() as model:
+        a = pm.Normal("a")
+        b = pm.Poisson("b", 1)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+            pm.sample(10, tune=10)
+        assert "Initializing NUTS" not in caplog.text
+
+
+def test_sample_var_names():
+    # Generate data
+    seed = 1234
+    rng = np.random.default_rng(seed)
+
+    group = rng.choice(list("ABCD"), size=100)
+    x = rng.normal(size=100)
+    y = rng.normal(size=100)
+
+    group_values, group_idx = np.unique(group, return_inverse=True)
+
+    coords = {"group": group_values}
+
+    # Create model
+    with pm.Model(coords=coords) as model:
+        b_group = pm.Normal("b_group", dims="group")
+        b_x = pm.Normal("b_x")
+        mu = pm.Deterministic("mu", b_group[group_idx] + b_x * x)
+        sigma = pm.HalfNormal("sigma")
+        pm.Normal("y", mu=mu, sigma=sigma, observed=y)
+
+    # Sample with and without var_names, but always with the same seed
+    with model:
+        idata_1 = pm.sample(tune=100, draws=100, random_seed=seed)
+        idata_2 = pm.sample(
+            tune=100, draws=100, var_names=["b_group", "b_x", "sigma"], random_seed=seed
+        )
+
+    assert "mu" in idata_1.posterior
+    assert "mu" not in idata_2.posterior
+
+    assert np.all(idata_1.posterior["b_group"] == idata_2.posterior["b_group"]).item()
+    assert np.all(idata_1.posterior["b_x"] == idata_2.posterior["b_x"]).item()
+    assert np.all(idata_1.posterior["sigma"] == idata_2.posterior["sigma"]).item()
+
+
+class TestAssignStepMethods:
+    def test_bernoulli(self):
+        """Test bernoulli distribution is assigned binary gibbs metropolis method"""
+        with pm.Model() as model:
+            x = pm.Bernoulli("x", 0.5)
+        _, selected_steps = assign_step_methods(model, [])
+        assert selected_steps == {BinaryGibbsMetropolis: [model.rvs_to_values[x]]}
+
+    def test_normal(self):
+        """Test normal distribution is assigned NUTS method"""
+        with pm.Model() as model:
+            x = pm.Normal("x", 0, 1)
+        _, selected_steps = assign_step_methods(model, [])
+        assert selected_steps == {NUTS: [model.rvs_to_values[x]]}
+
+    def test_categorical(self):
+        """Test categorical distribution is assigned categorical gibbs metropolis method"""
+        with pm.Model() as model:
+            x = pm.Categorical("x", np.array([0.25, 0.75]))
+        _, selected_steps = assign_step_methods(model, [])
+        assert selected_steps == {BinaryGibbsMetropolis: [model.rvs_to_values[x]]}
+
+        with pm.Model() as model:
+            y = pm.Categorical("y", np.array([0.25, 0.70, 0.05]))
+        _, selected_steps = assign_step_methods(model, [])
+        assert selected_steps == {CategoricalGibbsMetropolis: [model.rvs_to_values[y]]}
+
+    def test_binomial(self):
+        """Test binomial distribution is assigned metropolis method."""
+        with pm.Model() as model:
+            x = pm.Binomial("x", 10, 0.5)
+        _, selected_steps = assign_step_methods(model, [])
+        assert selected_steps == {Metropolis: [model.rvs_to_values[x]]}
+
+    def test_normal_nograd_op(self):
+        """Test normal distribution without an implemented gradient is assigned slice method"""
+        with pm.Model() as model:
+            x = pm.Normal("x", 0, 1)
+
+            # a custom PyTensor Op that does not have a grad:
+            is_64 = pytensor.config.floatX == "float64"
+            itypes = [pt.dscalar] if is_64 else [pt.fscalar]
+            otypes = [pt.dscalar] if is_64 else [pt.fscalar]
+
+            @wrap_py(itypes=itypes, otypes=otypes)
+            def kill_grad(x):
+                return x
+
+            data = np.random.normal(size=(100,))
+            y = pm.Normal(
+                "y", mu=kill_grad(x), sigma=1, observed=data.astype(pytensor.config.floatX)
+            )
+
+        _, selected_steps = assign_step_methods(model, [])
+        assert selected_steps == {Slice: [model.rvs_to_values[x]]}
+
+    @pytest.fixture
+    def step_methods(self):
+        """Make sure we reset the STEP_METHODS after the test is done."""
+        methods_copy = STEP_METHODS.copy()
+        yield STEP_METHODS
+        STEP_METHODS.clear()
+        for method in methods_copy:
+            STEP_METHODS.append(method)
+
+    def test_modify_step_methods(self, step_methods):
+        """Test step methods can be changed"""
+        step_methods.remove(NUTS)
+
+        with pm.Model() as model:
+            pm.Normal("x", 0, 1)
+
+        _, selected_steps = assign_step_methods(model, [])
+        assert NUTS not in selected_steps
+
+        # add back nuts
+        step_methods.append(NUTS)
+
+        with pm.Model() as model:
+            pm.Normal("x", 0, 1)
+
+        _, selected_steps = assign_step_methods(model, [])
+        assert NUTS in selected_steps
+
+    def test_step_vars_in_model(self):
+        """Test if error is raised if step variable is not found in model.value_vars"""
+        with pm.Model() as model:
+            c1 = pm.HalfNormal("c1")
+            c2 = pm.HalfNormal("c2")
+
+            with pytensor.config.change_flags(mode=fast_unstable_sampling_mode):
+                step1 = NUTS([c1])
+                step2 = NUTS([c2])
+                step2.vars = [c2]
+                step = CompoundStep([step1, step2])
+                with pytest.raises(
+                    ValueError,
+                    match=r".* assigned to .* sampler is not a value variable in the model. You can use `util.get_value_vars_from_user_vars` to parse user provided variables.",
+                ):
+                    assign_step_methods(model, step)
+
+
+class TestType:
+    samplers = (Metropolis, Slice, HamiltonianMC, NUTS)
+
+    @pytensor.config.change_flags(floatX="float64", warn_float64="ignore")
+    def test_float64(self):
+        with pm.Model() as model:
+            x = pm.Normal("x", initval=np.array(1.0, dtype="float64"))
+            obs = pm.Normal("obs", mu=x, sigma=1.0, observed=np.random.randn(5))
+
+        assert x.dtype == "float64"
+        assert obs.dtype == "float64"
+
+        for sampler in self.samplers:
+            with model:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                    pm.sample(draws=10, tune=10, chains=1, step=sampler())
+
+    @pytensor.config.change_flags(floatX="float32", warn_float64="warn")
+    def test_float32(self):
+        with pm.Model() as model:
+            x = pm.Normal("x", initval=np.array(1.0, dtype="float32"))
+            obs = pm.Normal("obs", mu=x, sigma=1.0, observed=np.random.randn(5).astype("float32"))
+
+        assert x.dtype == "float32"
+        assert obs.dtype == "float32"
+
+        for sampler in self.samplers:
+            with model:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                    pm.sample(draws=10, tune=10, chains=1, step=sampler())
+
+
+class TestShared:
+    def test_sample(self, seeded_test):
+        x = np.random.normal(size=100)
+        y = x + np.random.normal(scale=1e-2, size=100)
+
+        x_pred = np.linspace(-3, 3, 200)
+
+        x_shared = pytensor.shared(x)
+
+        with pm.Model() as model:
+            b = pm.Normal("b", 0.0, 10.0)
+            pm.Normal("obs", b * x_shared, np.sqrt(1e-2), observed=y, shape=x_shared.shape)
+            prior_trace0 = pm.sample_prior_predictive(1000)
+
+            # Nutpie fails with unnamed shared variables
+            idata = pm.sample(1000, tune=1000, chains=1, nuts_sampler="pymc")
+            pp_trace0 = pm.sample_posterior_predictive(idata)
+
+            x_shared.set_value(x_pred)
+            prior_trace1 = pm.sample_prior_predictive(1000)
+            pp_trace1 = pm.sample_posterior_predictive(idata)
+
+        assert prior_trace0.prior["b"].shape == (1, 1000)
+        assert prior_trace0.prior_predictive["obs"].shape == (1, 1000, 100)
+        np.testing.assert_allclose(
+            x, pp_trace0.posterior_predictive["obs"].mean(("chain", "draw")), atol=1e-1
+        )
+
+        assert prior_trace1.prior["b"].shape == (1, 1000)
+        assert prior_trace1.prior_predictive["obs"].shape == (1, 1000, 200)
+        np.testing.assert_allclose(
+            x_pred, pp_trace1.posterior_predictive["obs"].mean(("chain", "draw")), atol=1e-1
+        )
+
+
+class TestQuietMode:
+    """Tests for the quiet parameter in pm.sample()."""
+
+    def test_quiet_suppresses_logging(self, caplog):
+        with pm.Model():
+            x = pm.Normal("x", 0, 1)
+            with caplog.at_level(logging.DEBUG, logger="pymc"):
+                idata = pm.sample(
+                    draws=10,
+                    tune=10,
+                    chains=1,
+                    cores=1,
+                    quiet=True,
+                    random_seed=42,
+                    progressbar=False,
+                )
+
+        pymc_logs = [r for r in caplog.records if r.name.startswith("pymc")]
+        assert len(pymc_logs) == 0
+
+        assert hasattr(idata, "posterior")
+        assert "x" in idata.posterior
+
+    def test_quiet_overrides_progressbar(self, caplog):
+        """Test that quiet=True overrides progressbar=True."""
+        with pm.Model():
+            x = pm.Normal("x", 0, 1)
+            with caplog.at_level(logging.DEBUG, logger="pymc"):
+                idata = pm.sample(
+                    draws=10,
+                    tune=10,
+                    chains=1,
+                    cores=1,
+                    progressbar=True,
+                    quiet=True,
+                    random_seed=42,
+                )
+
+        pymc_logs = [r for r in caplog.records if r.name.startswith("pymc")]
+        assert len(pymc_logs) == 0
+
+    def test_quiet_false_shows_logs(self, caplog):
+        """Test that quiet=False (default) shows logs."""
+        with pm.Model():
+            x = pm.Normal("x", 0, 1)
+            with caplog.at_level(logging.INFO, logger="pymc"):
+                idata = pm.sample(
+                    draws=10,
+                    tune=10,
+                    chains=1,
+                    cores=1,
+                    quiet=False,
+                    progressbar=False,
+                    random_seed=42,
+                )
+
+        pymc_logs = [r for r in caplog.records if r.name.startswith("pymc")]
+        assert len(pymc_logs) > 0
+
+
+class TestDefaultTuneSteps:
+    def test_default(self):
+        with pm.Model():
+            x = pm.Normal("x")
+            step = pm.Metropolis([x])
+
+        assert get_default_tune_steps(step, 42) == 42
+        assert get_default_tune_steps(step, 0) == 0
+        assert get_default_tune_steps(step, None) == 1000
+
+        assert get_default_tune_steps(step, 37, default_tune_steps=999) == 37
+        assert get_default_tune_steps(step, 0, default_tune_steps=999) == 0
+        assert get_default_tune_steps(step, None, default_tune_steps=999) == 999
+
+    def test_custom_step(self):
+        class PerfectMetropolis(pm.Metropolis):
+            default_tune_steps = 0
+
+        with pm.Model():
+            y = pm.Categorical("y", p=[0.25, 0.25, 0.5])
+            step = PerfectMetropolis([y])
+
+        assert get_default_tune_steps(step, None) == 0
+        assert get_default_tune_steps(step, 15) == 15
+
+    def test_compound_step(self):
+        class PerfectMetropolis(pm.Metropolis):
+            default_tune_steps = 0
+
+        class AlmostPerfectMetropolis(pm.Metropolis):
+            default_tune_steps = 50
+
+        with pm.Model():
+            x = pm.Normal("x")
+            y = pm.Categorical("y", p=[0.25, 0.25, 0.5])
+            step0 = pm.CompoundStep([pm.NUTS([x]), AlmostPerfectMetropolis([y])])
+            step1 = pm.CompoundStep([PerfectMetropolis([x]), AlmostPerfectMetropolis([y])])
+
+        assert get_default_tune_steps(step0, None) == 1000
+        assert get_default_tune_steps(step0, None, default_tune_steps=999) == 999
+        assert get_default_tune_steps(step0, 999) == 999
+        assert get_default_tune_steps(step0, 1001) == 1001
+
+        assert get_default_tune_steps(step1, None) == 50
+        assert get_default_tune_steps(step1, None, default_tune_steps=999) == 50
+        assert get_default_tune_steps(step1, 999) == 999
+
+    def test_sample(self):
+        class PerfectMetropolis(pm.Metropolis):
+            default_tune_steps = 0
+
+        with pm.Model():
+            y = pm.Bernoulli("y", p=0.25)
+            step = PerfectMetropolis([y])
+
+            kwargs = {
+                "draws": 10,
+                "step": step,
+                "chains": 1,
+                "discard_tuned_samples": False,
+                "progressbar": False,
+                "compute_convergence_checks": False,
+            }
+
+            idata = pm.sample(tune=None, **kwargs)
+            assert not hasattr(idata, "warmup_posterior")
+
+            idata = pm.sample(tune=10, **kwargs)
+            assert idata.warmup_posterior.sizes["draw"] == 10
