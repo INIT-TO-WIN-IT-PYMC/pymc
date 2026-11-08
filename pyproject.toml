@@ -1,0 +1,160 @@
+[build-system]
+requires = ["setuptools>=77", "versioneer[toml]==0.29"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymc"
+dynamic = ["version"]
+requires-python = ">=3.12,<3.15"
+authors = [{ name = "PyMC Developers", email = "pymc.devs@gmail.com" }]
+description = "Probabilistic Programming in Python: Bayesian Modeling and Probabilistic Machine Learning with PyTensor"
+readme = "README.rst"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Operating System :: OS Independent",
+]
+keywords = [
+    "statistics",
+    "modelling",
+    "inference",
+    "probabilistic-programming",
+    "bayesian-inference",
+    "science",
+]
+dependencies = [
+    "arviz>=1.1.0,<2.0",
+    "better-optimize>=0.5.1,<0.6",
+    "cachetools>=4.2.1,<7",
+    "cloudpickle",
+    "numpy>=1.25.0",
+    "pandas>=0.24.0",
+    "pytensor>=3.3.6,<3.4",
+    "rich>=13.7.1",
+    "scipy>=1.4.1",
+    "threadpoolctl>=3.1.0,<4.0.0",
+    "typing-extensions>=3.7.4",
+]
+
+[project.optional-dependencies]
+nutpie = [
+    "nutpie>=0.16.10,<1",
+]
+zarr = [
+    "zarr>=3.1.0,<4",
+]
+
+[project.urls]
+repository = "http://github.com/pymc-devs/pymc"
+
+[tool.setuptools.packages.find]
+include = ["pymc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+minversion = "6.0"
+xfail_strict = true
+addopts = ["--color=yes"]
+
+[tool.versioneer]
+VCS = "git"
+style = "pep440"
+versionfile_source = "pymc/_version.py"
+versionfile_build = "pymc/_version.py"
+tag_prefix = "v"
+
+[tool.mypy]
+python_version = "3.12"
+no_implicit_optional = false
+strict_optional = true
+warn_redundant_casts = false
+check_untyped_defs = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
+ignore_missing_imports = true
+warn_unused_ignores = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["_version.py"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["C4", "D", "E", "F", "I", "UP", "W", "RUF", "T20", "TID"]
+ignore = [
+  "E501",
+  "F841", # Local variable name is assigned to but never used
+  "RUF001", # String contains ambiguous character (such as Greek letters)
+  "RUF002", # Docstring contains ambiguous character (such as Greek letters)
+  "RUF012", # Mutable class attributes should be annotated with `typing.ClassVar`
+  "D100",  # Missing docstring in public module
+  "D101",  # Missing docstring in public class
+  "D102",  # Missing docstring in public method
+  "D103",  # Missing docstring in public function
+  "D104",  # Missing docstring in public package
+  "D105",  # Missing docstring in magic method
+  "D401",  # Ignore Umbridge level of control
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.isort]
+lines-between-types = 1
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = [
+  "F401", # Module imported but unused
+  "F403", # 'from module import *' used; unable to detect undefined names
+]
+"docs/source/*" = ["D"]
+"pymc/__init__.py" = [
+  "E402", # Module level import not at top of file
+]
+"pymc/dims/__init__.py" = [
+  "E402", # Module level import not at top of file
+]
+"pymc/dims/math.py" = [
+  "F401", # Module imported but unused
+  "F403", # 'from module import *' used; unable to detect undefined names
+]
+"pymc/stats/__init__.py" = [
+  "E402", # Module level import not at top of file
+]
+"pymc/logprob/__init__.py" = [
+  "I001", # Import block is un-sorted or un-formatted
+]
+"tests/*" = ["D"]
+"scripts/run_mypy.py" = [
+  "T201", # No print statements
+]
+"scripts/publish_release_notes_to_discourse.py" = [
+  "T201", # No print statements
+]
+"*.ipynb" = [
+  "T201", # No print statements
+]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: nocover",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+]
+
+[tool.coverage.run]
+omit = ["*examples*"]
