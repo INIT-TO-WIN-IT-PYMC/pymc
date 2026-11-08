@@ -1,0 +1,17 @@
+arviz<2.0,>=1.1.0
+better-optimize<0.6,>=0.5.1
+cachetools<7,>=4.2.1
+cloudpickle
+numpy>=1.25.0
+pandas>=0.24.0
+pytensor<3.4,>=3.3.6
+rich>=13.7.1
+scipy>=1.4.1
+threadpoolctl<4.0.0,>=3.1.0
+typing-extensions>=3.7.4
+
+[nutpie]
+nutpie<1,>=0.16.10
+
+[zarr]
+zarr<4,>=3.1.0
