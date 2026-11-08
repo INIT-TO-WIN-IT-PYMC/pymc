@@ -1,0 +1,130 @@
+#   Copyright 2025 - present The PyMC Developers
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+import math
+
+import numpy as np
+import pytensor.tensor as pt
+import pytest
+
+from pytensor.xtensor import as_xtensor
+
+import pymc.distributions as regular_distributions
+
+from pymc import Model
+from pymc.dims import Categorical, Dirichlet, MvNormal, ZeroSumNormal
+from tests.dims.utils import assert_equivalent_logp_graph, assert_equivalent_random_graph
+
+pytestmark = pytest.mark.filterwarnings("error")
+
+
+def test_categorical():
+    coords = {"a": range(3), "b": range(4)}
+    p = pt.as_tensor([0.1, 0.2, 0.3, 0.4])
+    # logit_p values whose softmax is exactly representable in float64
+    # so that the xtensor and tensor constant-folding paths agree bit-for-bit.
+    logit_p = pt.as_tensor([0.0, 0.0, math.log(2), math.log(4)])
+    p_xr = as_xtensor(p, dims=("b",))
+    logit_p_xr = as_xtensor(logit_p, dims=("b",))
+
+    with Model(coords=coords) as model:
+        Categorical("x", p=p_xr, core_dims="b", dims=("a",))
+        Categorical("y", logit_p=logit_p_xr, core_dims="b", dims=("a",))
+
+    with Model(coords=coords) as reference_model:
+        regular_distributions.Categorical("x", p=p, dims=("a",))
+        regular_distributions.Categorical("y", logit_p=logit_p, dims=("a",))
+
+    assert_equivalent_random_graph(model, reference_model)
+    assert_equivalent_logp_graph(model, reference_model)
+
+
+def test_dirichlet():
+    coords = {"a": range(3), "b": range(2)}
+    alpha = pt.as_tensor([1, 2, 3])
+
+    alpha_xr = as_xtensor(alpha, dims=("b",))
+
+    with Model(coords=coords) as model:
+        Dirichlet("x", a=alpha_xr, core_dims="b", dims=("a", "b"))
+
+    with Model(coords=coords) as reference_model:
+        regular_distributions.Dirichlet("x", a=alpha, dims=("a", "b"))
+
+    assert_equivalent_random_graph(model, reference_model)
+
+    # logp graphs end up different, but they mean the same thing
+    np.testing.assert_allclose(
+        model.compile_logp()(model.initial_point()),
+        reference_model.compile_logp()(reference_model.initial_point()),
+    )
+
+
+def test_mvnormal():
+    coords = {"a": range(3), "b": range(2)}
+    mu = pt.as_tensor([1, 2])
+    cov = pt.as_tensor([[1, 0.5], [0.5, 2]])
+    chol = pt.as_tensor([[1, 0], [0.5, np.sqrt(1.75)]])
+
+    mu_xr = as_xtensor(mu, dims=("b",))
+    cov_xr = as_xtensor(cov, dims=("b", "b'"))
+    chol_xr = as_xtensor(chol, dims=("b", "b'"))
+
+    with Model(coords=coords) as model:
+        MvNormal("x", mu=mu_xr, cov=cov_xr, core_dims=("b", "b'"), dims=("a", "b"))
+        MvNormal("y", mu=mu_xr, chol=chol_xr, core_dims=("b", "b'"), dims=("a", "b"))
+
+    with Model(coords=coords) as reference_model:
+        regular_distributions.MvNormal("x", mu=mu, cov=cov, dims=("a", "b"))
+        regular_distributions.MvNormal("y", mu=mu, chol=chol, dims=("a", "b"))
+
+    assert_equivalent_random_graph(model, reference_model)
+    assert_equivalent_logp_graph(model, reference_model)
+
+
+def test_zerosumnormal():
+    coords = {"a": range(3), "b": range(2)}
+    with Model(coords=coords) as model:
+        ZeroSumNormal("x", core_dims=("b",), dims=("a", "b"))
+        ZeroSumNormal("y", sigma=3, core_dims=("b",), dims=("a", "b"))
+        ZeroSumNormal("z", core_dims=("a", "b"), dims=("a", "b"))
+
+    with Model(coords=coords) as reference_model:
+        regular_distributions.ZeroSumNormal("x", dims=("a", "b"))
+        regular_distributions.ZeroSumNormal("y", sigma=3, n_zerosum_axes=1, dims=("a", "b"))
+        regular_distributions.ZeroSumNormal("z", n_zerosum_axes=2, dims=("a", "b"))
+
+    assert_equivalent_random_graph(model, reference_model)
+    # Logp is correct, but we have join(..., -1) and join(..., 1), that don't get canonicalized to the same
+    # Should work once https://github.com/pymc-devs/pytensor/issues/1505 is fixed
+    # assert_equivalent_logp_graph(model, reference_model)
+
+
+def test_zerosumnormal_batch_sigma():
+    coords = {"a": range(3), "b": range(5)}
+    sigma = np.array([1, 2, 3.0])
+    with Model(coords=coords) as model:
+        ZeroSumNormal(
+            "x",
+            sigma=as_xtensor(sigma, dims=("a",)),
+            core_dims=("b",),
+        )
+
+    with Model(coords=coords) as ref_model:
+        regular_distributions.ZeroSumNormal("x", sigma=sigma[:, None], dims=("a", "b"))
+
+    ip = model.initial_point()
+    np.testing.assert_allclose(
+        model.compile_logp(sum=False)(ip),
+        ref_model.compile_logp(sum=False)(ip),
+    )
